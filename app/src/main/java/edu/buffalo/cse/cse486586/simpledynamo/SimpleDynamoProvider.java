@@ -76,14 +76,14 @@ public class SimpleDynamoProvider extends ContentProvider {
             new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg.toString());
         } else {
             try {
-                String hashedkey = genHash(selection);
-                String currentPort = getSuccessorFrom(hashedkey);
-                if (selfPort.equals(currentPort)) {
-                    deleteFromDB(selection, selectionArgs);
+                String hashedKey = genHash(selection);
+                String nextPort = getSuccessorFrom(hashedKey);
+                if (selfPort.equals(nextPort)) {
+                    rowsDeleted = deleteFromDB(selection, selectionArgs);
                 }
                 Message msg = new Message(DELETE);
                 msg.setKey(selection);
-                new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg.toString(), currentPort);
+                new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg.toString(), nextPort);
             } catch (NoSuchAlgorithmException e) {
                 e.printStackTrace();
             }
@@ -112,12 +112,12 @@ public class SimpleDynamoProvider extends ContentProvider {
         }
         try {
             String hashedKey = genHash(key);
-            String currentPort = getSuccessorFrom(hashedKey);
+            String nextPort = getSuccessorFrom(hashedKey);
             Message msg = new Message(INSERT, key, value);
-            if(selfPort.equals(currentPort)) {
+            if (selfPort.equals(nextPort)) {
                 insertInDB(uri, values);
             }
-            new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg.toString(), currentPort);
+            new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg.toString(), nextPort);
         } catch (NoSuchAlgorithmException e) {
             e.printStackTrace();
         }
@@ -179,13 +179,9 @@ public class SimpleDynamoProvider extends ContentProvider {
             Log.e(LOG_TAG, "Can't create a ServerSocket");
         }
 
-//        SQLiteDatabase database = mDbHelper.getWritableDatabase();
-//        int rowsDeleted = database.delete(TABLE_NAME, null, null);
-//        database.close();
-//        if (rowsDeleted != 0) {
-//            Message msg = new Message(RECOVER);
-//            new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg.toString(), portStr);
-//        }
+
+        Message msg = new Message(RECOVER);
+        new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg.toString(), portStr);
         return true;
     }
 
@@ -248,9 +244,9 @@ public class SimpleDynamoProvider extends ContentProvider {
             return matrixCursor;
         } else {
             try {
-                String hashedkey = genHash(selection);
-                String currentPort = getSuccessorFrom(hashedkey);
-                if (selfPort.equals(currentPort)) {
+                String hashedKey = genHash(selection);
+                String nextPort = getSuccessorFrom(hashedKey);
+                if (selfPort.equals(nextPort)) {
                     // Query selection key from the database
                     selectionArgs = new String[]{selection};
                     selection = KEY_FIELD + "=?";
@@ -259,8 +255,9 @@ public class SimpleDynamoProvider extends ContentProvider {
                     return resultCursor;
                 } else {
                     try {
+                        String succ[] = getSuccessorOf(nextPort);
                         //Get the socket with the given port number
-                        Socket socket = getSocket(getPortFromLineNumber(currentPort));
+                        Socket socket = getSocket(getPortFromLineNumber(succ[1]));
                         try {
                             //Create an output data stream to send QUERY message to a particular node
                             DataOutputStream out = new DataOutputStream(socket.getOutputStream());
@@ -273,10 +270,9 @@ public class SimpleDynamoProvider extends ContentProvider {
                             //Flush the output stream
                             out.flush();
                         } catch (IOException e) {
-                            Log.e(LOG_TAG, "Error writing data to output stream in QUERY for port " + currentPort);
+                            Log.e(LOG_TAG, "Error writing data to output stream in QUERY for port " + nextPort);
                         }
 
-                        String succ[] = getSuccessorOf(currentPort);
                         String msgReceived;
                         try {
                             //Create an input data stream to read messages from a particular node
@@ -285,10 +281,10 @@ public class SimpleDynamoProvider extends ContentProvider {
                                 //Read the message received
                                 msgReceived = in.readUTF();
                                 if (msgReceived.isEmpty()) {
-                                    msgReceived = queryReplicas(succ[0], selection, succ[1]);
+                                    msgReceived = queryReplicas(succ[0], selection, nextPort);
                                 }
                             } catch (Exception e) {
-                                msgReceived = queryReplicas(succ[0], selection, currentPort);
+                                msgReceived = queryReplicas(succ[0], selection, nextPort);
                             }
                             //Create Matrix Cursor for placing all the messages from that node
                             MatrixCursor matrixCursor = new MatrixCursor(COLUMN_NAMES);
@@ -298,11 +294,11 @@ public class SimpleDynamoProvider extends ContentProvider {
                             matrixCursor.addRow(keyValue);
                             return matrixCursor;
                         } catch (IOException e) {
-                            Log.e(LOG_TAG, "Error reading data from input stream in QUERY for port " + currentPort);
+                            Log.e(LOG_TAG, "Error reading data from input stream in QUERY for port " + nextPort);
                         }
                         socket.close();
                     } catch (IOException e) {
-                        Log.e(LOG_TAG, "Error in socket creation" + currentPort);
+                        Log.e(LOG_TAG, "Error in socket creation" + nextPort);
                     }
                 }
             } catch (NoSuchAlgorithmException e) {
@@ -377,10 +373,10 @@ public class SimpleDynamoProvider extends ContentProvider {
                                         //Get the value from the column
                                         value = cursor.getString(cursor.getColumnIndex(VALUE_FIELD));
                                     }
-                                    out.writeUTF(value);
+                                    if (value != null) {
+                                        out.writeUTF(value);
+                                    }
                                     out.flush();
-                                    cursor.close();
-                                    database.close();
                                     break;
 
                                 case QUERY_ALL:
@@ -414,8 +410,6 @@ public class SimpleDynamoProvider extends ContentProvider {
                                     }
                                     out1.writeUTF(output.toString());
                                     out1.flush();
-                                    resultCursor.close();
-                                    sqlDatabase.close();
                                     break;
 
                                 case DELETE:
@@ -460,7 +454,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                         String remotePort = msgs[1];
                         String[] succ = getSuccessorOf(remotePort);
                         System.out.println("INSERT " + msgs[0] + " " + remotePort);
-                        if(!selfPort.equals(remotePort)) {
+                        if (!selfPort.equals(remotePort)) {
                             insertTo(msgPacket, remotePort);
                         }
                         for (String succPort : succ) {
@@ -471,7 +465,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                     case DELETE:
                         String remotePort1 = msgs[1];
                         String[] succ1 = getSuccessorOf(remotePort1);
-                        if(!selfPort.equals(remotePort1)) {
+                        if (!selfPort.equals(remotePort1)) {
                             deletionFrom(msgPacket[1], remotePort1);
                         }
                         for (String succPort : succ1) {
@@ -514,10 +508,10 @@ public class SimpleDynamoProvider extends ContentProvider {
         }
     }
 
-    private void insertTo(String[] msgPacket, String remotePort) {
+    private void insertTo(String[] msgPacket, String port) {
         try {
             //Get the socket with the given port number
-            Socket socket = getSocket(getPortFromLineNumber(remotePort));
+            Socket socket = getSocket(getPortFromLineNumber(port));
             //Create an output data stream to send INSERT message to a particular node
             DataOutputStream out = new DataOutputStream(socket.getOutputStream());
             //Create INSERT msg with key and value
@@ -528,14 +522,14 @@ public class SimpleDynamoProvider extends ContentProvider {
             out.flush();
             socket.close();
         } catch (IOException e) {
-            Log.e(LOG_TAG, "Error in writing INSERT on port " + remotePort + e);
+            Log.e(LOG_TAG, "Error in writing INSERT on port " + port + e);
         }
     }
 
-    private void deletionFrom(String key, String succPort) {
+    private void deletionFrom(String key, String port) {
         try {
             //Get the socket with the given port number
-            Socket socket = getSocket(getPortFromLineNumber(succPort));
+            Socket socket = getSocket(getPortFromLineNumber(port));
             //Create an output data stream to send DELETE message to a particular node
             DataOutputStream out = new DataOutputStream(socket.getOutputStream());
             //Create DELETE msg with key to delete all the message from that node
@@ -547,47 +541,56 @@ public class SimpleDynamoProvider extends ContentProvider {
             out.flush();
             socket.close();
         } catch (IOException e) {
-            Log.e(LOG_TAG, "Error in writing DELETE on port " + succPort);
+            Log.e(LOG_TAG, "Error in writing DELETE on port " + port);
         }
     }
 
-    private synchronized void recover(String port) {
-        String succ[] = getSuccessorOf(port);
-        String pred[] = getPredecessorOf(port);
-        String[] recoveryPorts = {succ[0], pred[0], pred[1]};
-        Map<String, String> map = new HashMap<String, String>();
-        for (String remotePort : recoveryPorts) {
-            try {
-                Socket socket = getSocket(getPortFromLineNumber(remotePort));
-                Message msgToSend = new Message(QUERY_ALL);
-                DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-                out.writeUTF(msgToSend.toString());
-                out.flush();
+    private void recover(String port) {
+        SQLiteDatabase database = mDbHelper.getWritableDatabase();
+        database.beginTransaction();
+        int rowsDeleted = database.delete(TABLE_NAME, null, null);
+        if (rowsDeleted != 0) {
+            String succ[] = getSuccessorOf(port);
+            String pred[] = getPredecessorOf(port);
+            String[] recoveryPorts = {succ[0], succ[1], pred[0], pred[1]};
+            Map<String, String> map = new HashMap<String, String>();
+            for (String remotePort : recoveryPorts) {
+                try {
+                    Socket socket = getSocket(getPortFromLineNumber(remotePort));
+                    Message msgToSend = new Message(QUERY_ALL);
+                    DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                    out.writeUTF(msgToSend.toString());
+                    out.flush();
 
-                DataInputStream in = new DataInputStream(socket.getInputStream());
-                String op = in.readUTF();
-                map.putAll(getAllMessages(op));
-                socket.close();
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
-        for (Map.Entry<String, String> m : map.entrySet()) {
-            String key = m.getKey();
-            String value = m.getValue();
-            try {
-                String hashedkey = genHash(key);
-                String tport = getSuccessorFrom(hashedkey);
-                if (tport.equals(port) || tport.equals(pred[0]) || tport.equals(pred[1])) {
-                    ContentValues values = new ContentValues();
-                    values.put(KEY_FIELD, key);
-                    values.put(VALUE_FIELD, value);
-                    mContentResolver.insert(BASE_CONTENT_URI, values);
+                    DataInputStream in = new DataInputStream(socket.getInputStream());
+                    String op = in.readUTF();
+                    Map<String, String> m = getAllMessages(op);
+                    display(m);
+                    map.putAll(getAllMessages(op));
+                    socket.close();
+                } catch (IOException e) {
+                    e.printStackTrace();
                 }
-            } catch (NoSuchAlgorithmException e) {
-                e.printStackTrace();
+            }
+            for (Map.Entry<String, String> m : map.entrySet()) {
+                String key = m.getKey();
+                String value = m.getValue();
+                try {
+                    String hashedkey = genHash(key);
+                    String tport = getSuccessorFrom(hashedkey);
+                    if (tport.equals(port) || tport.equals(pred[0]) || tport.equals(pred[1])) {
+                        ContentValues values = new ContentValues();
+                        values.put(KEY_FIELD, key);
+                        values.put(VALUE_FIELD, value);
+                        database.insertWithOnConflict(TABLE_NAME, null, values, SQLiteDatabase.CONFLICT_REPLACE);
+                    }
+                } catch (NoSuchAlgorithmException e) {
+                    e.printStackTrace();
+                }
             }
         }
+        database.setTransactionSuccessful();
+        database.endTransaction();
     }
 
     private void display(Map<String, String> smap) {
