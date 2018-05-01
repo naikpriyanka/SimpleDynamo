@@ -25,6 +25,7 @@ import java.security.NoSuchAlgorithmException;
 import java.util.Formatter;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.TreeMap;
 
 import edu.buffalo.cse.cse486586.simpledynamo.data.SimpleDynamoDbHelper;
 import edu.buffalo.cse.cse486586.simpledynamo.model.Message;
@@ -44,6 +45,13 @@ import static edu.buffalo.cse.cse486586.simpledynamo.model.MessageType.QUERY_ALL
 import static edu.buffalo.cse.cse486586.simpledynamo.model.MessageType.RECOVER;
 import static edu.buffalo.cse.cse486586.simpledynamo.model.MessageType.getEnumBy;
 
+/*
+ * References :
+ * Ethan Blanton slides on Concurrency Control, Consistency, Amazon Dynamo
+ * Amazon Dynamo : https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf
+ * Chain Replication : http://www.cs.cornell.edu/home/rvr/papers/OSDI04.pdf
+ */
+
 public class SimpleDynamoProvider extends ContentProvider {
 
     public static final String LOG_TAG = SimpleDynamoProvider.class.getSimpleName();
@@ -56,7 +64,8 @@ public class SimpleDynamoProvider extends ContentProvider {
     private static final String LDUMP = "@"; //Specific AVD
     private static final String GDUMP = "*"; //All AVDs
     private String selfPort = null; //Used to store the port number of the AVD
-    private String[] portTable = {"5562", "5556", "5554", "5558", "5560"}; //Storing ports in order
+    private Map<String, String> lookupTable = new TreeMap<String, String>(); //Formation of ring in order of their hash values
+    private String[] portTable; //Storing ports in order
     private String[] hashTable; //Storing hash values of port
 
     //Make two columns for key and value
@@ -66,9 +75,11 @@ public class SimpleDynamoProvider extends ContentProvider {
     public int delete(Uri uri, String selection, String[] selectionArgs) {
         int rowsDeleted = 0;
 
-        // Get writeable database
+        //Get writable database
         SQLiteDatabase database = mDbHelper.getWritableDatabase();
+
         if (LDUMP.equals(selection)) {
+            //Delete all the msgs from a particular node
             rowsDeleted = database.delete(TABLE_NAME, null, null);
         } else if (GDUMP.equals(selection)) {
             //Delete all the msgs from each node, one at a time by connecting remotely
@@ -76,16 +87,17 @@ public class SimpleDynamoProvider extends ContentProvider {
             new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg.toString());
         } else {
             try {
-                String hashedKey = genHash(selection);
-                String nextPort = getSuccessorFrom(hashedKey);
-                if (selfPort.equals(nextPort)) {
+                String hashedKey = genHash(selection);  //Get hash of the key to find the node where the key is situated
+                String nextPort = getSuccessorFrom(hashedKey); //Get the successor port from the hash value
+                if (selfPort.equals(nextPort)) { //Check if the successor port is equal to self port
                     rowsDeleted = deleteFromDB(selection, selectionArgs);
                 }
+                //Delete the key from all the successors
                 Message msg = new Message(DELETE);
                 msg.setKey(selection);
                 new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg.toString(), nextPort);
             } catch (NoSuchAlgorithmException e) {
-                e.printStackTrace();
+                Log.e(LOG_TAG, "Error in generating hash for the key " + selection);
             }
         }
         return rowsDeleted;
@@ -99,27 +111,28 @@ public class SimpleDynamoProvider extends ContentProvider {
 
     @Override
     public Uri insert(Uri uri, ContentValues values) {
-        // Check that the key is not null
+        //Check that the key is not null
         String key = values.getAsString(KEY_FIELD);
         if (key == null) {
             throw new IllegalArgumentException("Message requires a key");
         }
 
-        // Check that the value is not null
+        //Check that the value is not null
         String value = values.getAsString(VALUE_FIELD);
         if (value == null) {
             throw new IllegalArgumentException("Message requires a value");
         }
         try {
-            String hashedKey = genHash(key);
-            String nextPort = getSuccessorFrom(hashedKey);
-            Message msg = new Message(INSERT, key, value);
-            if (selfPort.equals(nextPort)) {
+            String hashedKey = genHash(key); //Get hash of the key to find the node where the key is situated
+            String nextPort = getSuccessorFrom(hashedKey); //Get the successor port from the hash value
+            if (selfPort.equals(nextPort)) { //Check if the successor port is equal to self port
                 insertInDB(uri, values);
             }
+            //Replicate data to successors
+            Message msg = new Message(INSERT, key, value);
             new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg.toString(), nextPort);
         } catch (NoSuchAlgorithmException e) {
-            e.printStackTrace();
+            Log.e(LOG_TAG, "Error in generating hash for the key " + key);
         }
         return null;
     }
@@ -128,24 +141,24 @@ public class SimpleDynamoProvider extends ContentProvider {
         /*
          * Reference: https://developer.android.com/reference/android/database/sqlite/SQLiteDatabase.html#insertWithOnConflict(java.lang.String,%20java.lang.String,%20android.content.ContentValues,%20int)
          */
-        // Get writable database
+        //Get writable database
         SQLiteDatabase database = mDbHelper.getWritableDatabase();
 
         long id = database.insertWithOnConflict(TABLE_NAME, null, values, SQLiteDatabase.CONFLICT_REPLACE);
 
-        // If the ID is -1, then the insertion failed. Log an error and return null.
+        //If the ID is -1, then the insertion failed. Log an error and return null.
         if (id == -1) {
             Log.e(LOG_TAG, "Failed to insert row for " + uri);
             return null;
         }
-        // Notify all listeners that the data has changed for the message content URI
+        //Notify all listeners that the data has changed for the message content URI
         mContentResolver.notifyChange(uri, null);
-        // Return the new URI with the ID (of the newly inserted row) appended at the end
+        //Return the new URI with the ID (of the newly inserted row) appended at the end
         return ContentUris.withAppendedId(uri, id);
     }
 
     private int deleteFromDB(String selection, String[] selectionArgs) {
-        // Get writable database
+        //Get writable database
         SQLiteDatabase database = mDbHelper.getWritableDatabase();
         selectionArgs = new String[]{selection};
         selection = KEY_FIELD + "=?";
@@ -157,14 +170,13 @@ public class SimpleDynamoProvider extends ContentProvider {
         Context context = this.getContext();
         mContentResolver = context.getContentResolver();
         mDbHelper = new SimpleDynamoDbHelper(context);
-        initHashTable();
+        initLookUpTable();
 
         //Calculate the port number that this AVD listens on
         TelephonyManager tel = (TelephonyManager) context.getSystemService(TELEPHONY_SERVICE);
         String portStr = tel.getLine1Number().substring(tel.getLine1Number().length() - 4);
         //Store the current port in self port for future references
         selfPort = portStr;
-        System.out.println("Self Port " + selfPort);
 
         try {
             /*
@@ -178,23 +190,39 @@ public class SimpleDynamoProvider extends ContentProvider {
         } catch (IOException e) {
             Log.e(LOG_TAG, "Can't create a ServerSocket");
         }
-
-
+        //Send recovery message if the node has failed and joined in
         Message msg = new Message(RECOVER);
         new ClientTask().executeOnExecutor(AsyncTask.SERIAL_EXECUTOR, msg.toString(), portStr);
         return true;
     }
 
+    //Method to create a lookup table in the order of the hash value and place them in two different tables for easy access
+    private void initLookUpTable() {
+        String[] ports = {"5554", "5556", "5558", "5560", "5562"};
+        for(String port : ports) {
+            try {
+                lookupTable.put(genHash(port), port);
+            } catch (NoSuchAlgorithmException e) {
+                Log.e(LOG_TAG, "Error in generating hash for the key " + port);
+            }
+        }
+        hashTable = lookupTable.keySet().toArray(new String[0]);
+        portTable = lookupTable.values().toArray(new String[0]);
+    }
+
     @Override
     public Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
-        // Get readable database
+        //Get readable database
         SQLiteDatabase database = mDbHelper.getReadableDatabase();
         Cursor resultCursor;
         if (LDUMP.equals(selection)) {
+            //Query all the msgs from a particular node
             resultCursor = database.query(TABLE_NAME, null, null, null, null, null, null);
             return resultCursor;
         } else if (GDUMP.equals(selection)) {
+            //Append messages from all the nodes
             StringBuilder output = new StringBuilder();
+            //Query all the msgs from each node, one at a time by connecting remotely
             for (String remotePort : portTable) {
                 try {
                     //Get the socket with the given port number
@@ -244,10 +272,10 @@ public class SimpleDynamoProvider extends ContentProvider {
             return matrixCursor;
         } else {
             try {
-                String hashedKey = genHash(selection);
-                String nextPort = getSuccessorFrom(hashedKey);
-                if (selfPort.equals(nextPort)) {
-                    // Query selection key from the database
+                String hashedKey = genHash(selection); //Get hash of the key to find the node where the key is situated
+                String nextPort = getSuccessorFrom(hashedKey); //Get the port from the hash value
+                if (selfPort.equals(nextPort)) { //Check if the successor port is equal to self port
+                    //Query selection key from the database
                     selectionArgs = new String[]{selection};
                     selection = KEY_FIELD + "=?";
                     resultCursor = database.query(TABLE_NAME, projection, selection, selectionArgs, null, null, sortOrder);
@@ -255,8 +283,13 @@ public class SimpleDynamoProvider extends ContentProvider {
                     return resultCursor;
                 } else {
                     try {
+                        //Get the successor node of the port
                         String succ[] = getSuccessorOf(nextPort);
-                        //Get the socket with the given port number
+                        /*
+                         * Get the socket with the given port number
+                         * Start querying from the tail of the list according to chain replication
+                         * Query the last replica in the partition
+                         */
                         Socket socket = getSocket(getPortFromLineNumber(succ[1]));
                         try {
                             //Create an output data stream to send QUERY message to a particular node
@@ -281,9 +314,11 @@ public class SimpleDynamoProvider extends ContentProvider {
                                 //Read the message received
                                 msgReceived = in.readUTF();
                                 if (msgReceived.isEmpty()) {
+                                    //If msg received is empty then query the second last replica in the partition
                                     msgReceived = queryReplicas(succ[0], selection, nextPort);
                                 }
                             } catch (Exception e) {
+                                //If there is exception while reading message then query the second last replica in the partition
                                 msgReceived = queryReplicas(succ[0], selection, nextPort);
                             }
                             //Create Matrix Cursor for placing all the messages from that node
@@ -302,7 +337,7 @@ public class SimpleDynamoProvider extends ContentProvider {
                     }
                 }
             } catch (NoSuchAlgorithmException e) {
-                e.printStackTrace();
+                Log.e(LOG_TAG, "Error in generating hash for the key " + selection);
             }
         }
         return null;
@@ -345,13 +380,11 @@ public class SimpleDynamoProvider extends ContentProvider {
                         if (msgType != null) {
                             switch (msgType) {
                                 case INSERT:
-                                    System.out.println("INSERT " + msgReceived);
                                     //Insert the key and the value in the database
                                     ContentValues values = new ContentValues();
                                     values.put(KEY_FIELD, msgPacket[1]);
                                     values.put(VALUE_FIELD, msgPacket[2]);
                                     insertInDB(BASE_CONTENT_URI, values);
-//                                    mContentResolver.insert(BASE_CONTENT_URI, values);
                                     break;
 
                                 case QUERY:
@@ -414,12 +447,10 @@ public class SimpleDynamoProvider extends ContentProvider {
 
                                 case DELETE:
                                     deleteFromDB(msgPacket[1], null);
-//                                    mContentResolver.delete(BASE_CONTENT_URI, msgPacket[1], null);
                                     break;
 
                                 case DELETE_ALL:
                                     deleteFromDB(null, null);
-//                                    mContentResolver.delete(BASE_CONTENT_URI, null, null);
                                     break;
 
                                 default:
@@ -444,36 +475,46 @@ public class SimpleDynamoProvider extends ContentProvider {
         protected Void doInBackground(String... msgs) {
             String[] msgPacket = msgs[0].split(DELIMITER);
             MessageType msgType = getEnumBy(msgPacket[0]);
+            String remotePort;
+            String[] succ;
             if (msgType != null) {
                 switch (msgType) {
                     case RECOVER:
-                        recover(msgs[1]);
+                        //Recover the given port
+                        remotePort = msgs[1];
+                        recover(remotePort);
                         break;
 
                     case INSERT:
-                        String remotePort = msgs[1];
-                        String[] succ = getSuccessorOf(remotePort);
-                        System.out.println("INSERT " + msgs[0] + " " + remotePort);
+                        remotePort = msgs[1];
+                        //Get the successor ports of the given port
+                        succ = getSuccessorOf(remotePort);
+                        //If the remote port is not equal to self then connect remotely and insert data in database
                         if (!selfPort.equals(remotePort)) {
                             insertTo(msgPacket, remotePort);
                         }
+                        //Insert data in replicas
                         for (String succPort : succ) {
                             insertTo(msgPacket, succPort);
                         }
                         break;
 
                     case DELETE:
-                        String remotePort1 = msgs[1];
-                        String[] succ1 = getSuccessorOf(remotePort1);
-                        if (!selfPort.equals(remotePort1)) {
-                            deletionFrom(msgPacket[1], remotePort1);
+                        remotePort = msgs[1];
+                        //Get the successor ports of the given port
+                        succ = getSuccessorOf(remotePort);
+                        //If the remote port is not equal to self then connect remotely and delete data in database
+                        if (!selfPort.equals(remotePort)) {
+                            deletionFrom(msgPacket[1], remotePort);
                         }
-                        for (String succPort : succ1) {
+                        //Delete data from replicas
+                        for (String succPort : succ) {
                             deletionFrom(msgPacket[1], succPort);
                         }
                         break;
 
                     case DELETE_ALL:
+                        //Delete all the messages from all the ports
                         for (String remotePort2 : portTable) {
                             deleteAllFrom(remotePort2);
                         }
@@ -545,59 +586,76 @@ public class SimpleDynamoProvider extends ContentProvider {
         }
     }
 
+    /*
+     * References for Transaction :
+     * https://medium.com/inloopx/transactions-and-threads-in-sqlite-on-android-215e46670f2d
+     * https://www.sqlite.org/isolation.html
+     * http://www.vogella.com/tutorials/AndroidSQLite/article.html
+     */
+    //Method to recover data for the given port
     private void recover(String port) {
+        //Get writable database
         SQLiteDatabase database = mDbHelper.getWritableDatabase();
+
+        //SQLite locks the database during a transaction
         database.beginTransaction();
+        //Delete all the previous messages stored in the database of the failed node
         int rowsDeleted = database.delete(TABLE_NAME, null, null);
+        //If the rows deleted from the database is not zero then the node was failed and recovered
         if (rowsDeleted != 0) {
+            //Recover the messages from the replica nodes and messages for which the node itself was replica
+            //Get the successor nodes of the recovered port
             String succ[] = getSuccessorOf(port);
+            //Get the predecessor nodes of the recovered port
             String pred[] = getPredecessorOf(port);
+            //Place them in an array for easy access
             String[] recoveryPorts = {succ[0], succ[1], pred[0], pred[1]};
+            //Create a map to store key-value retrieved from all the nodes
             Map<String, String> map = new HashMap<String, String>();
+            //Iterate over each port from which it can recover
             for (String remotePort : recoveryPorts) {
                 try {
+                    //Connect to the port
                     Socket socket = getSocket(getPortFromLineNumber(remotePort));
+                    //Get all the messages present at that node
                     Message msgToSend = new Message(QUERY_ALL);
                     DataOutputStream out = new DataOutputStream(socket.getOutputStream());
                     out.writeUTF(msgToSend.toString());
                     out.flush();
 
+                    //Get the message from the node
                     DataInputStream in = new DataInputStream(socket.getInputStream());
                     String op = in.readUTF();
-                    Map<String, String> m = getAllMessages(op);
-                    display(m);
+                    //Put it in the map
                     map.putAll(getAllMessages(op));
                     socket.close();
                 } catch (IOException e) {
-                    e.printStackTrace();
+                    Log.e(LOG_TAG, "Error in socket creation " + remotePort);
                 }
             }
+            //Iterate over the map to get the exact location of the msg and place it there
             for (Map.Entry<String, String> m : map.entrySet()) {
+                //Get the key and value from the map
                 String key = m.getKey();
                 String value = m.getValue();
                 try {
-                    String hashedkey = genHash(key);
-                    String tport = getSuccessorFrom(hashedkey);
-                    if (tport.equals(port) || tport.equals(pred[0]) || tport.equals(pred[1])) {
+                    String hashedKey = genHash(key); //Get hash of the key to find the node where the key is situated
+                    String nextPort = getSuccessorFrom(hashedKey); //Get the port from the hash value
+                    //Restore the data for the given port as well as for the predecessor because the port acted as replica for its predecessors
+                    //So the message that belongs to its predecessors should also be saved as replica for predecessors
+                    if (nextPort.equals(port) || nextPort.equals(pred[0]) || nextPort.equals(pred[1])) {
                         ContentValues values = new ContentValues();
                         values.put(KEY_FIELD, key);
                         values.put(VALUE_FIELD, value);
                         database.insertWithOnConflict(TABLE_NAME, null, values, SQLiteDatabase.CONFLICT_REPLACE);
                     }
                 } catch (NoSuchAlgorithmException e) {
-                    e.printStackTrace();
+                    Log.e(LOG_TAG, "Error in generating hash for the key " + key);
                 }
             }
         }
         database.setTransactionSuccessful();
         database.endTransaction();
-    }
-
-    private void display(Map<String, String> smap) {
-        for (Map.Entry<String, String> m : smap.entrySet()) {
-            System.out.println("Map values : " + m.getKey() + " " + m.getValue());
-        }
-        System.out.println("----------------------------------------------------------------");
     }
 
     //Method to create socket for the given port
@@ -613,17 +671,7 @@ public class SimpleDynamoProvider extends ContentProvider {
         return String.valueOf(Integer.parseInt(portStr) * 2);
     }
 
-    private void initHashTable() {
-        hashTable = new String[portTable.length];
-        for (int i = 0; i < portTable.length; i++) {
-            try {
-                hashTable[i] = genHash(portTable[i]);
-            } catch (NoSuchAlgorithmException e) {
-                e.printStackTrace();
-            }
-        }
-    }
-
+    //Method to get the appropriate port for the key
     private String getSuccessorFrom(String hashKey) {
         for (int i = 0; i < portTable.length; i++) {
             if (hashTable[i].compareTo(hashKey) > 0) { //Compare the hash values to get the successor port
@@ -640,7 +688,6 @@ public class SimpleDynamoProvider extends ContentProvider {
 
     //Method to separate out key and value from the message
     private Map<String, String> getAllMessages(String s) {
-        System.out.println("Get All Messages " + s);
         Map<String, String> messages = new HashMap<String, String>();
         String[] msgPackets = s.split(DELIMITER);
         if (msgPackets.length >= 2) {
@@ -651,6 +698,7 @@ public class SimpleDynamoProvider extends ContentProvider {
         return messages;
     }
 
+    //Method to get the two successor of the port
     private String[] getSuccessorOf(String port) {
         int index = search(port);
         String succ[] = new String[2];
@@ -661,6 +709,7 @@ public class SimpleDynamoProvider extends ContentProvider {
         return succ;
     }
 
+    //Method to get the position of the node in the ring
     private int search(String port) {
         for (int i = 0; i < portTable.length; i++) {
             if (portTable[i].equals(port)) {
@@ -670,6 +719,7 @@ public class SimpleDynamoProvider extends ContentProvider {
         return -1;
     }
 
+    //Method to get the two predecessor of the port
     private String[] getPredecessorOf(String port) {
         String pred[] = new String[2];
         int index = search(port);
@@ -680,6 +730,7 @@ public class SimpleDynamoProvider extends ContentProvider {
         return pred;
     }
 
+    //Method to query the replicas
     private String queryReplicas(String replicaPort1, String selection, String replicaPort2) {
         String output = null;
         try {
@@ -694,14 +745,17 @@ public class SimpleDynamoProvider extends ContentProvider {
             try {
                 //Read the message received
                 output = in.readUTF();
+                //If the message retrieved from the port is empty
                 if (output.isEmpty()) {
+                    //Query the next replica in the partition
                     output = queryReplicas(replicaPort2, selection, replicaPort2);
                 }
             } catch (Exception e) {
+                //In case of failure to read message from the port, query the next replica in the partition
                 output = queryReplicas(replicaPort2, selection, replicaPort2);
             }
         } catch (Exception e) {
-            e.printStackTrace();
+            Log.e(LOG_TAG, "Error in socket creation " + replicaPort1);
         }
         return output;
     }
